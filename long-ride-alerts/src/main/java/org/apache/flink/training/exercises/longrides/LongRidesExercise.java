@@ -21,7 +21,10 @@ package org.apache.flink.training.exercises.longrides;
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.JobExecutionResult;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.state.ValueState;
+import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.streaming.api.TimeCharacteristic;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
@@ -30,10 +33,11 @@ import org.apache.flink.streaming.api.functions.sink.SinkFunction;
 import org.apache.flink.streaming.api.functions.source.SourceFunction;
 import org.apache.flink.training.exercises.common.datatypes.TaxiRide;
 import org.apache.flink.training.exercises.common.sources.TaxiRideGenerator;
-import org.apache.flink.training.exercises.common.utils.MissingSolutionException;
 import org.apache.flink.util.Collector;
 
+import java.io.IOException;
 import java.time.Duration;
+import java.time.Instant;
 
 /**
  * The "Long Ride Alerts" exercise.
@@ -47,7 +51,9 @@ public class LongRidesExercise {
     private final SourceFunction<TaxiRide> source;
     private final SinkFunction<Long> sink;
 
-    /** Creates a job using the source and sink provided. */
+    /**
+     * Creates a job using the source and sink provided.
+     */
     public LongRidesExercise(SourceFunction<TaxiRide> source, SinkFunction<Long> sink) {
         this.source = source;
         this.sink = sink;
@@ -61,10 +67,9 @@ public class LongRidesExercise {
      */
     public JobExecutionResult execute() throws Exception {
 
-        // set up streaming execution environment
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
 
-        // start the data generator
         DataStream<TaxiRide> rides = env.addSource(source);
 
         // the WatermarkStrategy specifies how to extract timestamps and generate watermarks
@@ -98,17 +103,52 @@ public class LongRidesExercise {
     @VisibleForTesting
     public static class AlertFunction extends KeyedProcessFunction<Long, TaxiRide, Long> {
 
+        public static final Duration LONG_RIDE_HOURS = Duration.ofHours(2);
+        private transient ValueState<TaxiRide> taxiRideState;
+        private transient ValueState<Long> currentTimer;
+
         @Override
         public void open(Configuration config) throws Exception {
-            throw new MissingSolutionException();
+            taxiRideState = getRuntimeContext().getState(new ValueStateDescriptor<>("taxiRideState", TaxiRide.class));
+            currentTimer = getRuntimeContext().getState(new ValueStateDescriptor<>("currentTimer", Long.class));
         }
 
         @Override
-        public void processElement(TaxiRide ride, Context context, Collector<Long> out)
-                throws Exception {}
+        public void processElement(TaxiRide ride, Context ctx, Collector<Long> out) throws Exception {
+            if (taxiRideState.value() == null) { // either only START or END event received
+                taxiRideState.update(ride);
+                if (ride.isStart) {
+                    long timerTs = ride.eventTime.plus(LONG_RIDE_HOURS).toEpochMilli();
+                    ctx.timerService().registerEventTimeTimer(timerTs);
+                    currentTimer.update(timerTs);
+                }
+            } else { // both END and START events were received
+                if (getDurationOf(ride).getSeconds() > LONG_RIDE_HOURS.getSeconds()) {
+                    out.collect(ride.rideId);
+                }
+                if (!ride.isStart) {
+                    ctx.timerService().deleteEventTimeTimer(currentTimer.value());
+                }
+                clearStates();
+            }
+        }
+
+        private Duration getDurationOf(TaxiRide currentRide) throws IOException {
+            Instant storedEventTime = taxiRideState.value().eventTime;
+            return currentRide.isStart
+                    ? Duration.between(currentRide.eventTime, storedEventTime)
+                    : Duration.between(storedEventTime, currentRide.eventTime);
+        }
 
         @Override
-        public void onTimer(long timestamp, OnTimerContext context, Collector<Long> out)
-                throws Exception {}
+        public void onTimer(long timestamp, OnTimerContext context, Collector<Long> out) throws Exception {
+            out.collect(context.getCurrentKey());
+            clearStates();
+        }
+
+        private void clearStates() {
+            taxiRideState.clear();
+            currentTimer.clear();
+        }
     }
 }
